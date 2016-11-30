@@ -1,0 +1,343 @@
+#! /bin/sh
+exec ruby -S -x $0 "$@"
+#! ruby
+require 'open3'
+require 'optparse'
+require 'set'
+
+#
+# Keeps a list of files to be reviewed and other options to suggest reviewers, which are obtained by
+# parsing command line arguments and executing a git command.
+# If the command line arguments are invalid, this shows usage, and exits with 1.
+#
+class SolverParams
+  attr_reader :file_list, :excluded_authors, :print_mode, :is_quiet,
+    :history_depth, :candidate_limit
+
+  def initialize
+    @is_path_mode = false # Use arguments as the file path, instead of the diff base.
+    @excluded_authors = []
+    @print_mode = :default
+    @is_quiet = false
+    @history_depth = 100
+    @candidate_limit = 10
+
+    @includes_myself = false
+    @option_parser = create_option_parser
+
+    argv = ARGV.clone
+    parse!(argv)
+
+    # Use arguments as a file list if is_path_mode is true. Otherwise, use them as the diff base.
+    @file_list = @is_path_mode ? argv : ExternalCommandExecutor.git_diff_files(argv[0], argv[1])
+
+    my_email = ExternalCommandExecutor.git_my_email
+    @excluded_authors.push(my_email) if !@includes_myself && !my_email.empty?
+  end
+
+  private
+
+  BANNER = "Usage:\n" +
+    "  #{$0} [options] DIFF_BASE [DIFF_TARGET]\n" +
+    "  #{$0} [options] -p PATH_0 PATH_1 ... PATH_N\n\n"
+
+  def parse!(argv)
+    @option_parser.parse!(argv)
+    usage("No commit revision, branch name or file path.") if argv.size == 0
+  rescue OptionParser::ParseError => e
+    usage(e.message)
+  end
+
+  def create_option_parser
+    OptionParser.new do |option|
+      option.banner = BANNER
+      option.on(
+        "-p",
+        "--path",
+        "Use a list of file paths instead of the diff target") do |value|
+          @is_path_mode = value
+      end
+      option.on(
+        "-e AUTHOR1,AUTHOR2,...AUTHORn",
+        "--exclude-author AUTHOR1,AUTHOR2,...AUTHORn",
+        Array,
+        "Comma separated author list to exclude from reviewers") do |authors|
+          @excluded_authors.concat(authors)
+      end
+      option.on(
+        "-m",
+        "--include-myself",
+        "Include myself as a reviewer candidate") do |value|
+          @includes_myself = value
+      end
+      option.on(
+        "-d",
+        "--detail",
+        "Show details for each file. This overrides the preceding '-s' option.") do |value|
+          @print_mode = :detail if value
+      end
+      option.on(
+        "-s",
+        "--simple",
+        "Show only the reviewer list. This overrides the preceding '-d' option.") do |value|
+          @print_mode = :simple if value
+      end
+      option.on(
+        "-q",
+        "--quiet",
+        "Do not show any progress status") do |value|
+          @is_quiet = value
+      end
+      option.on(
+        "-h DEPTH",
+        "--history-depth DEPTH",
+        Integer,
+        "Depth of history (number of revisions) to find authors") do |depth|
+          @history_depth = depth
+      end
+      option.on(
+        "-c CANDIDATE_LIMIT",
+        "--candidate-limit CANDIDATE_LIMIT",
+        Integer,
+        "Maximum number of reviewer candidates for each file") do |count|
+          @candidate_limit = count
+      end
+    end
+  end
+
+  def usage(message)
+    $stderr.puts message
+    $stderr.puts @option_parser.to_s
+    exit 1
+  end
+end
+
+#
+# Collection of utility methods to call the external commands, "git" and "tput".
+#
+class ExternalCommandExecutor
+  def self.window_width
+    # To prevent the standard input from being overridden, don't use Open3.
+    `which -s tput && tput cols`.to_i
+  end
+
+  def self.git_my_email
+    call("git config user.email").chomp
+  end
+
+  def self.git_diff_files(diff_base, diff_target)
+    call("git diff #{diff_base} #{diff_target} --name-only").lines.map(&:chomp)
+  end
+
+  def self.git_history(file, excluded_authors, history_depth, candidate_limit)
+    filter_author_command =  excluded_authors.empty? ?
+      "" : "| egrep -v \"" + excluded_authors.join("|") + "\" "
+    command = "git log --pretty=\"%ae\" #{file} | head -#{history_depth} " +
+      filter_author_command + "| sort | uniq -c | sort -nr | head -#{candidate_limit}"
+    call(command).lines.map(&:chomp)
+  end
+
+  private
+
+  def self.call(external_command_string)
+    Open3.capture3(external_command_string)[0]
+  end
+end
+
+#
+# IO like class to suppress output like /dev/null.
+#
+class NilOutput
+  def puts(obj) end
+  def print(obj) end
+end
+
+#
+# Progress bar drawn on the console.
+#
+class ProgressBar
+  PERCENTAGE_STR = "%.1f%"
+  PERCENTAGE_STR_LENGTH = 7
+
+  def initialize(window_cols, max, output)
+    @window_cols = window_cols
+    @max = max
+    @output = output
+  end
+
+  def print_bar(progress)
+    return if @window_cols <= PERCENTAGE_STR_LENGTH
+
+    progress = [@max, progress].min.to_f
+    progress_ratio = progress / @max
+    bar_area_length = @window_cols - PERCENTAGE_STR_LENGTH
+    bar_str = ("#" * (progress_ratio * bar_area_length))
+    @output.print "\r" +
+      bar_str.ljust(bar_area_length) +
+      (PERCENTAGE_STR % (progress_ratio * 100)).rjust(PERCENTAGE_STR_LENGTH)
+  end
+end
+
+#
+# Author data holding pairs of file names and scores.
+#
+class AuthorData
+  attr_reader :files
+
+  def initialize
+    @files = {}
+  end
+
+  def add_file(file, score)
+    if score > 0
+      @files[file] = score
+    else
+      @files.delete(file)
+    end
+  end
+
+  def total_score_for(files)
+    score = 0
+    files.each do |file|
+      score += score_for(file)
+    end
+    score
+  end
+
+  def elements
+    @files.keys
+  end
+
+  def score_for(file)
+    @files[file] || 0
+  end
+end
+
+#
+# Solver of the set cover problem which is finding a combination of sets to cover all the elements.
+# To avoid confusion with Ruby's "Set", we use the term "group" to mean "set" in this class.
+#
+class SetCoverProblemSolver
+
+  # Solves the set cover problem using the greedy algorithm
+  # @param elements [Set] :elements Set of element to be covered.
+  # @param groups [Map] :groups Map of group ID to group data. This data type must have a method.
+  #   total_score_for([element]). The simplest implementation of total_score_for is the count of
+  #   elements in the group.
+  # @return [Set, Set]
+  #   First value: Set of group IDs to cover elements.
+  #   Second value: Set of elements which is not covered by any group.
+  def self.solve(elements, groups)
+    uncovered_elements = elements.clone
+    uncovering_group_ids = Set.new(groups.keys)
+
+    while !uncovered_elements.empty?
+      candidate_id = nil
+      candidate_score = 0
+
+      # Choose the best group for uncovered elements
+      uncovering_group_ids.each do |group_id|
+        group_data = groups[group_id]
+        next unless group_data
+
+        score = group_data.total_score_for(uncovered_elements)
+        if candidate_score < score
+          candidate_id = group_id
+          candidate_score = score
+        end
+      end
+
+      break unless candidate_id
+
+      uncovering_group_ids.delete(candidate_id)
+      uncovered_elements -= groups[candidate_id].elements
+    end
+
+    return Set.new(groups.keys) - uncovering_group_ids, uncovered_elements
+  end
+end
+
+def puts_files(output, files)
+  files.each do |file|
+    output.puts "  " + file
+  end
+end
+
+# Script body from here.
+
+# Parse arguments, and get a changed file list.
+params = SolverParams.new
+e = params.is_quiet ? NilOutput.new : $stderr
+if params.file_list.empty?
+  e.puts "No changed file was found. Check the following items."
+  e.puts "  1. Confirm the availability of these commands: git, head, uniq, sort, and egrep."
+  e.puts "  2. Confirm that there are changed files with 'git diff --name-only'."
+  e.puts "  3. Put the '-p' option to specify files by path."
+  exit 0
+end
+
+# Obtain the git history for each file.
+e.puts "Getting the log for each file..."
+progress_bar = ProgressBar.new(ExternalCommandExecutor.window_width, params.file_list.size, e)
+progress_bar.print_bar(0)
+author_email_to_data = {} # Map of author mail String to AuthorData
+file_to_authors = {} # Map of file String to the author mail list
+params.file_list.each do |file|
+  file_to_authors[file] = Set.new
+  top_score = nil
+  history_results = ExternalCommandExecutor.git_history(
+    file, params.excluded_authors, params.history_depth, params.candidate_limit)
+
+  history_results.each do |result|
+    match_result = result.match(/(\d+)\s+(\S+)/)
+    next unless match_result
+
+    score = match_result[1].to_f
+    top_score ||= score
+    author_email = match_result[2]
+    author_email_to_data[author_email] ||= AuthorData.new
+    author_email_to_data[author_email].add_file(file, score / top_score)
+    file_to_authors[file].add(author_email)
+  end
+  progress_bar.print_bar(file_to_authors.size)
+end
+
+# The main calculation for finding reviewers.
+e.puts "Calculating reviewer candidates..."
+reviewers, unreviewable_files =
+  SetCoverProblemSolver.solve(Set.new(file_to_authors.keys), author_email_to_data)
+
+# Output the result. The flow is as follows.
+#  - Output reviewers and exit if in simple mode.
+#  - Output reviewers and the reviewable files.
+#  - Output files no one can review.
+#  - Output file details.
+e.puts "Finished!"
+e.puts ""
+o = $stdout
+
+if params.print_mode == :simple
+  o.puts reviewers.to_a
+  exit 0
+end
+
+reviewers.each do |author_email|
+  o.puts author_email
+  puts_files(o, author_email_to_data[author_email].files.keys)
+end
+
+if !unreviewable_files.empty?
+  o.puts "no one can review"
+  puts_files(o, unreviewable_files)
+end
+
+if params.print_mode == :detail
+  o.puts ""
+  o.puts "== FILE DETAILS =="
+  file_to_authors.each_pair do |file, authors|
+    o.puts file
+    authors.each do |author_email|
+      o.puts ("  %1.3f, " % author_email_to_data[author_email].score_for(file)) + author_email
+    end
+  end
+end
